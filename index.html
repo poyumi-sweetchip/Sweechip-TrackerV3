@@ -111,6 +111,7 @@
         const DAILY_RECORDS_COLLECTION = `artifacts/${appId}/public/data/daily_records`;
         const INVENTORY_DOC_PATH = `artifacts/${appId}/public/data/inventory/current_stock`;
         const LABOR_PAYMENTS_COLLECTION = `artifacts/${appId}/public/data/labor_payments`;
+        const LABOR_ADJUSTMENTS_COLLECTION = `artifacts/${appId}/public/data/labor_adjustments`;
         const ORDER_TRACKER_COLLECTION = `artifacts/${appId}/public/data/order_tracker`;  
         const EXPENSES_COLLECTION = `artifacts/${appId}/public/data/expenses`;
         const SUPPLIERS_COLLECTION = `artifacts/${appId}/public/data/suppliers`;
@@ -253,7 +254,8 @@
                     appCosts = { ...appCosts, ...doc.data() };
                 }
                 renderCostingForm();
-                fetchAllDataForAnalytics(); 
+                // We don't call fetchAllDataForAnalytics here to avoid race conditions.
+                // It will be called by the liability listener.
             });
 
             onSnapshot(doc(db, INVENTORY_DOC_PATH), doc => {
@@ -279,12 +281,9 @@
             onSnapshot(query(collection(db, ORDER_TRACKER_COLLECTION), orderBy("dueDate", "asc")), snap => renderOrders(snap.docs.map(d => ({id: d.id, ...d.data()}))));
             onSnapshot(query(collection(db, SUPPLIERS_COLLECTION), orderBy("name", "asc")), snap => renderSuppliersList(snap.docs.map(d => ({id: d.id, ...d.data()}))));
             onSnapshot(query(collection(db, DEFECTS_COLLECTION), orderBy("timestamp", "desc")), snap => renderDefectsList(snap.docs.map(d => ({id:d.id, ...d.data()}))));
-
-            // Listener to update analytics whenever primary financial data changes
-            const collectionsToWatch = [DAILY_RECORDS_COLLECTION, LABOR_PAYMENTS_COLLECTION, EXPENSES_COLLECTION];
-            collectionsToWatch.forEach(colPath => {
-                onSnapshot(collection(db, colPath), fetchAllDataForAnalytics);
-            });
+            
+            // Centralized listener for liability and analytics to prevent race conditions
+            setupLiabilityAndAnalyticsListeners();
         };
 
         // --- DOM EVENT LISTENERS ---
@@ -309,13 +308,13 @@
             document.getElementById('modal-cancel-edit-design-btn').addEventListener('click', () => {
                 document.getElementById('edit-design-modal').classList.add('hidden');
             });
+            document.getElementById('adjustment-form').addEventListener('submit', handleLaborAdjustment);
+            document.getElementById('modal-cancel-adjustment-btn').addEventListener('click', () => {
+                document.getElementById('adjustment-modal').classList.add('hidden');
+            });
             document.getElementById('updateFoamBtn').addEventListener('click', () => {
                 const val = document.getElementById('manualFoamStock').value;
                 updateSimpleStock('stockFoamCut', val);
-            });
-            document.getElementById('updateFinishedBtn').addEventListener('click', () => {
-                const val = document.getElementById('manualFinishedStock').value;
-                updateSimpleStock('stockFinishedProducts', val);
             });
             document.getElementById('analytics-filter-btn').addEventListener('click', fetchAllDataForAnalytics);
             document.getElementById('export-production-btn').addEventListener('click', () => {
@@ -352,29 +351,136 @@
                  ]);
                  exportToCSV(headers, data, `sweechip_expenses_${getTodayDate()}.csv`);
             });
+
+            // Delegated event listener for adjust buttons
+            document.getElementById('tab-content-salary').addEventListener('click', (event) => {
+                if (event.target.classList.contains('adjust-balance-btn')) {
+                    const recipient = event.target.dataset.recipient;
+                    openAdjustmentModal(recipient);
+                }
+            });
         };
         
-        // --- DATA FETCHING for Analytics ---
+        // --- DATA FETCHING & CALCULATIONS ---
+
+        // Function to calculate and render liabilities. This is called by the central listener.
+        const calculateAndRenderLiabilities = (allTimeRecords, allLaborPayments, allAdjustments) => {
+            let tailorIncurred = 0, cutter1Incurred = 0, cutter2Incurred = 0;
+            allTimeRecords.forEach(rec => {
+                tailorIncurred += (rec.tailoredCovers || 0);
+                cutter1Incurred += (rec.coverCuts || 0);
+                cutter2Incurred += (rec.foamCuts || 0);
+            });
+
+            const tailorLiability = tailorIncurred * appCosts.tailorRate;
+            const cutter1Liability = cutter1Incurred * appCosts.cutter1Rate;
+            const cutter2Liability = cutter2Incurred * appCosts.cutter2Rate;
+            const totalLaborLiability = tailorLiability + cutter1Liability + cutter2Liability;
+
+            let tailorPaid = allLaborPayments.filter(p => p.recipient === "Tailor").reduce((sum, p) => sum + p.amount, 0);
+            let cutter1Paid = allLaborPayments.filter(p => p.recipient === "Cutter 1").reduce((sum, p) => sum + p.amount, 0);
+            let cutter2Paid = allLaborPayments.filter(p => p.recipient === "Cutter 2").reduce((sum, p) => sum + p.amount, 0);
+            const generalPaid = allLaborPayments.filter(p => p.recipient === "General").reduce((sum, p) => sum + p.amount, 0);
+
+            let tailorAdjusted = allAdjustments.filter(a => a.recipient === "Tailor").reduce((sum, a) => sum + a.amount, 0);
+            let cutter1Adjusted = allAdjustments.filter(a => a.recipient === "Cutter 1").reduce((sum, a) => sum + a.amount, 0);
+            let cutter2Adjusted = allAdjustments.filter(a => a.recipient === "Cutter 2").reduce((sum, a) => sum + a.amount, 0);
+
+            const splitRatio = totalLaborLiability > 0 
+                ? { t: tailorLiability / totalLaborLiability, c1: cutter1Liability / totalLaborLiability, c2: cutter2Liability / totalLaborLiability }
+                : { t: 1/3, c1: 1/3, c2: 1/3 };
+            
+            tailorPaid += generalPaid * splitRatio.t;
+            cutter1Paid += generalPaid * splitRatio.c1;
+            cutter2Paid += generalPaid * splitRatio.c2;
+
+            tailorOutstandingBalance = tailorLiability - tailorPaid - tailorAdjusted;
+            cutter1OutstandingBalance = cutter1Liability - cutter1Paid - cutter1Adjusted;
+            cutter2OutstandingBalance = cutter2Liability - cutter2Paid - cutter2Adjusted;
+            const totalLaborOutstanding = tailorOutstandingBalance + cutter1OutstandingBalance + cutter2OutstandingBalance;
+
+            document.getElementById("tailor-incurred").textContent = formatPHP(tailorLiability);
+            document.getElementById("cutter1-incurred").textContent = formatPHP(cutter1Liability);
+            document.getElementById("cutter2-incurred").textContent = formatPHP(cutter2Liability);
+            document.getElementById("tailor-paid").textContent = formatPHP(tailorPaid);
+            document.getElementById("cutter1-paid").textContent = formatPHP(cutter1Paid);
+            document.getElementById("cutter2-paid").textContent = formatPHP(cutter2Paid);
+            document.getElementById("tailor-adjusted").textContent = formatPHP(tailorAdjusted);
+            document.getElementById("cutter1-adjusted").textContent = formatPHP(cutter1Adjusted);
+            document.getElementById("cutter2-adjusted").textContent = formatPHP(cutter2Adjusted);
+            
+            const tailorOutstandingEl = document.getElementById("tailor-outstanding");
+            tailorOutstandingEl.textContent = formatPHP(tailorOutstandingBalance);
+            tailorOutstandingEl.className = `text-lg font-extrabold ${tailorOutstandingBalance > 0 ? "text-red-700" : "text-green-600"}`;
+
+            const cutter1OutstandingEl = document.getElementById("cutter1-outstanding");
+            cutter1OutstandingEl.textContent = formatPHP(cutter1OutstandingBalance);
+            cutter1OutstandingEl.className = `text-lg font-extrabold ${cutter1OutstandingBalance > 0 ? "text-red-700" : "text-green-600"}`;
+            
+            const cutter2OutstandingEl = document.getElementById("cutter2-outstanding");
+            cutter2OutstandingEl.textContent = formatPHP(cutter2OutstandingBalance);
+            cutter2OutstandingEl.className = `text-lg font-extrabold ${cutter2OutstandingBalance > 0 ? "text-red-700" : "text-green-600"}`;
+            
+            const totalOutstandingEl = document.getElementById("labor-outstanding");
+            totalOutstandingEl.textContent = formatPHP(totalLaborOutstanding);
+            totalOutstandingEl.className = `text-4xl font-extrabold ${totalLaborOutstanding > 0 ? "text-red-500" : "text-green-600"}`;
+             document.getElementById("dashboard-pending-payout").textContent = formatPHP(totalLaborOutstanding);
+        };
+
+        const setupLiabilityAndAnalyticsListeners = () => {
+            let allTimeRecords = [];
+            let allLaborPayments = [];
+            let allAdjustments = [];
+
+            const recalculate = () => {
+                calculateAndRenderLiabilities(allTimeRecords, allLaborPayments, allAdjustments);
+                fetchAllDataForAnalytics(); // Now call analytics after liabilities are stable
+            };
+
+            onSnapshot(query(collection(db, DAILY_RECORDS_COLLECTION)), snap => {
+                allTimeRecords = snap.docs.map(doc => doc.data());
+                recalculate();
+            });
+            onSnapshot(query(collection(db, LABOR_PAYMENTS_COLLECTION)), snap => {
+                allLaborPayments = snap.docs.map(doc => doc.data());
+                recalculate();
+            });
+            onSnapshot(query(collection(db, LABOR_ADJUSTMENTS_COLLECTION)), snap => {
+                allAdjustments = snap.docs.map(doc => doc.data());
+                recalculate();
+            });
+            // Also listen to expenses for the analytics tab
+            onSnapshot(query(collection(db, EXPENSES_COLLECTION)), snap => {
+                recalculate();
+            });
+        };
+
         const fetchAllDataForAnalytics = async () => {
             if (!db) return; // Guard against running before DB is initialized
 
             const startDate = document.getElementById('analytics-start-date').value;
             const endDate = document.getElementById('analytics-end-date').value;
 
-            const dateConstraints = [];
-            if (startDate) dateConstraints.push(where("date", ">=", startDate));
-            if (endDate) dateConstraints.push(where("date", "<=", endDate));
+            const dateConstraintsRecords = [];
+            const dateConstraintsExpenses = [];
+            if (startDate) {
+                dateConstraintsRecords.push(where("date", ">=", startDate));
+                dateConstraintsExpenses.push(where("date", ">=", startDate));
+            }
+            if (endDate) {
+                dateConstraintsRecords.push(where("date", "<=", endDate));
+                dateConstraintsExpenses.push(where("date", "<=", endDate));
+            }
 
-            const queries = [
-                getDocs(query(collection(db, DAILY_RECORDS_COLLECTION), ...dateConstraints)),
-                getDocs(query(collection(db, LABOR_PAYMENTS_COLLECTION))), // Payments not filtered by date for liability calc
-                getDocs(query(collection(db, EXPENSES_COLLECTION), ...dateConstraints))
-            ];
-            const [recordsSnap, paymentsSnap, expensesSnap] = await Promise.all(queries);
-            const allDailyRecords = recordsSnap.docs.map(doc => doc.data());
-            const allLaborPayments = paymentsSnap.docs.map(doc => doc.data());
-            const allExpenses = expensesSnap.docs.map(doc => doc.data());
-            renderAnalytics(allDailyRecords, allLaborPayments, allExpenses, startDate, endDate);
+            const recordsQuery = getDocs(query(collection(db, DAILY_RECORDS_COLLECTION), ...dateConstraintsRecords));
+            const expensesQuery = getDocs(query(collection(db, EXPENSES_COLLECTION), ...dateConstraintsExpenses));
+
+            const [recordsSnap, expensesSnap] = await Promise.all([recordsQuery, expensesQuery]);
+            
+            const filteredRecords = recordsSnap.docs.map(doc => doc.data());
+            const filteredExpenses = expensesSnap.docs.map(doc => doc.data());
+
+            renderAnalytics(filteredRecords, filteredExpenses, startDate, endDate);
         };
         
         // --- RENDER FUNCTIONS (Updating the UI) ---
@@ -386,7 +492,6 @@
             document.getElementById("stock-tailored-covers").textContent = inventoryData.stockTailoredCovers || 0;
             document.getElementById("stock-products").textContent = inventoryData.stockFinishedProducts || 0;
             document.getElementById("manualFoamStock").value = inventoryData.stockFoamCut || 0;
-            document.getElementById("manualFinishedStock").value = inventoryData.stockFinishedProducts || 0;
 
             // Dashboard
             document.getElementById("dashboard-finished-stock").textContent = inventoryData.stockFinishedProducts || 0;
@@ -426,7 +531,8 @@
 
             const sewnDesigns = inventoryData.coverDesigns || {};
             const cutDesigns = inventoryData.cutCoversByDesign || {};
-            const allDesignNames = [...new Set([...Object.keys(sewnDesigns), ...Object.keys(cutDesigns)])].sort();
+            const finishedDesigns = inventoryData.finishedProductsByDesign || {};
+            const allDesignNames = [...new Set([...Object.keys(sewnDesigns), ...Object.keys(cutDesigns), ...Object.keys(finishedDesigns)])].sort();
 
             const sewnDetailContainer = document.getElementById("cover-designs-detail");
             sewnDetailContainer.innerHTML = "";
@@ -455,13 +561,29 @@
                         </div>`;
                 });
             }
+
+            const finishedDetailContainer = document.getElementById("finished-products-detail");
+            finishedDetailContainer.innerHTML = "";
+            if (allDesignNames.length === 0 && Object.keys(finishedDesigns).length === 0) {
+                finishedDetailContainer.innerHTML = '<p class="text-sm brown-text italic">No finished stock tracked yet.</p>';
+            } else {
+                allDesignNames.forEach(name => {
+                    finishedDetailContainer.innerHTML += `
+                        <div class="flex justify-between items-center text-sm bg-white/50 p-2 rounded-lg">
+                            <span class="brown-text">${name}:</span>
+                            <span class="font-bold pink-text">${finishedDesigns[name] || 0}</span>
+                        </div>`;
+                });
+            }
             
-            renderStockAdjustmentForms(sewnDesigns, cutDesigns);
+            renderStockAdjustmentForms(sewnDesigns, cutDesigns, finishedDesigns);
             renderTailorProductivityInputs(allDesignNames);
             renderProcessorProductivityInputs(allDesignNames);
+            renderAssembledProductivityInputs(allDesignNames);
+            renderSoldProductivityInputs(allDesignNames);
         };
 
-        const renderProductivityInputs = (containerId, designs, totalInputId, prefix) => {
+        const renderProductivityInputs = (containerId, designs, totalInputId, totalDisplayId, prefix) => {
             const container = document.getElementById(containerId);
             container.innerHTML = "";
 
@@ -469,6 +591,8 @@
                 container.innerHTML = '<p class="text-sm text-center italic brown-text">No cover designs found. Add designs in the Inventory tab first.</p>';
                 return;
             }
+            
+            const totalDisplayEl = totalDisplayId ? document.getElementById(totalDisplayId) : null;
 
             designs.forEach(name => {
                 const div = document.createElement('div');
@@ -486,22 +610,35 @@
                     total += parseInt(input.value || 0);
                 });
                 document.getElementById(totalInputId).value = total;
+                if (totalDisplayEl) {
+                    totalDisplayEl.textContent = total;
+                }
             });
         };
 
         const renderTailorProductivityInputs = (designs) => {
-            renderProductivityInputs('tailor-design-inputs', designs, 'tailoredCovers', 'sewn');
+            renderProductivityInputs('tailor-design-inputs', designs, 'tailoredCovers', 'tailoredCovers-total-display', 'sewn');
         };
 
         const renderProcessorProductivityInputs = (designs) => {
-            renderProductivityInputs('processor-design-inputs', designs, 'coverCuts', 'cut');
+            renderProductivityInputs('processor-design-inputs', designs, 'coverCuts', 'coverCuts-total-display', 'cut');
         };
 
-        const renderStockAdjustmentForms = (sewnDesigns, cutDesigns) => {
+        const renderAssembledProductivityInputs = (designs) => {
+            renderProductivityInputs('assembled-design-inputs', designs, 'completedMattresses', 'completedMattresses-total-display', 'assembled');
+        };
+
+        const renderSoldProductivityInputs = (designs) => {
+            renderProductivityInputs('sold-design-inputs', designs, 'productsSold', 'productsSold-total-display', 'sold');
+        };
+
+        const renderStockAdjustmentForms = (sewnDesigns, cutDesigns, finishedDesigns) => {
             const sewnContainer = document.getElementById("current-design-list");
             sewnContainer.innerHTML = "";
             const cutContainer = document.getElementById("current-cut-design-list");
             cutContainer.innerHTML = "";
+            const finishedContainer = document.getElementById("current-finished-design-list");
+            finishedContainer.innerHTML = "";
 
             const addButtonsAndValue = (container, name, stockValue, type) => {
                 const designEl = document.createElement('div');
@@ -539,6 +676,15 @@
                 });
             } else {
                 cutContainer.innerHTML = '<p class="text-sm text-center italic brown-text">No cut stock tracked.</p>';
+            }
+
+            const allDesignKeys = [...new Set([...sortedSewnKeys, ...sortedCutKeys, ...Object.keys(finishedDesigns || {})])].sort();
+            if(allDesignKeys.length > 0){
+                 allDesignKeys.forEach(name => {
+                    addButtonsAndValue(finishedContainer, name, finishedDesigns[name], 'finished');
+                });
+            } else {
+                finishedContainer.innerHTML = '<p class="text-sm text-center italic brown-text">No finished stock tracked.</p>';
             }
         };
 
@@ -644,6 +790,20 @@
                         .join('; ');
                 }
                 
+                let assembledDesignsTooltip = "No specific designs logged.";
+                if (rec.assembledMattressesByDesign && Object.keys(rec.assembledMattressesByDesign).length > 0) {
+                    assembledDesignsTooltip = Object.entries(rec.assembledMattressesByDesign)
+                        .map(([design, qty]) => `${design}: ${qty}`)
+                        .join('; ');
+                }
+
+                let soldDesignsTooltip = "No specific designs logged.";
+                if (rec.soldMattressesByDesign && Object.keys(rec.soldMattressesByDesign).length > 0) {
+                    soldDesignsTooltip = Object.entries(rec.soldMattressesByDesign)
+                        .map(([design, qty]) => `${design}: ${qty}`)
+                        .join('; ');
+                }
+
                 const editPayload = JSON.stringify(rec);
 
                 const row = tbody.insertRow();
@@ -653,8 +813,8 @@
                     <td class="p-2 text-center" title="${sewnDesignsTooltip}">${rec.tailoredCovers || 0}</td>
                     <td class="p-2 text-center" title="${cutDesignsTooltip}">${rec.coverCuts || 0}</td>
                     <td class="p-2 text-center">${rec.foamCuts || 0}</td>
-                    <td class="p-2 text-center">${rec.completedMattresses || 0}</td>
-                    <td class="p-2 text-center">${rec.productsSold || 0}</td>
+                    <td class="p-2 text-center" title="${assembledDesignsTooltip}">${rec.completedMattresses || 0}</td>
+                    <td class="p-2 text-center" title="${soldDesignsTooltip}">${rec.productsSold || 0}</td>
                     <td class="p-2 text-right font-medium">${formatPHP(revenue)}</td>
                     <td class="p-2 text-right">${formatPHP(laborIncurred)}</td>
                     <td class="p-2 text-center">
@@ -739,77 +899,18 @@
 
         // --- ANALYTICS & CHARTING ---
 
-        const renderAnalytics = (dailyRecords, laborPayments, expenses, startDate, endDate) => {
+        const renderAnalytics = (filteredRecords, filteredExpenses, startDate, endDate) => {
             // --- Calculations ---
             let totalRevenue = 0, totalCOGS = 0;
-            let tailorIncurred = 0, cutter1Incurred = 0, cutter2Incurred = 0;
-
-            // Note: Liability is calculated on ALL records for accuracy, not just the filtered date range.
-            const allTimeRecordsQuery = getDocs(query(collection(db, DAILY_RECORDS_COLLECTION)));
-            allTimeRecordsQuery.then(snap => {
-                snap.docs.forEach(doc => {
-                    const rec = doc.data();
-                    tailorIncurred += (rec.tailoredCovers || 0);
-                    cutter1Incurred += (rec.coverCuts || 0);
-                    cutter2Incurred += (rec.foamCuts || 0);
-                });
-                
-                const tailorLiability = tailorIncurred * appCosts.tailorRate;
-                const cutter1Liability = cutter1Incurred * appCosts.cutter1Rate;
-                const cutter2Liability = cutter2Incurred * appCosts.cutter2Rate;
-                const totalLaborLiability = tailorLiability + cutter1Liability + cutter2Liability;
-
-                let tailorPaid = laborPayments.filter(p => p.recipient === "Tailor").reduce((sum, p) => sum + p.amount, 0);
-                let cutter1Paid = laborPayments.filter(p => p.recipient === "Cutter 1").reduce((sum, p) => sum + p.amount, 0);
-                let cutter2Paid = laborPayments.filter(p => p.recipient === "Cutter 2").reduce((sum, p) => sum + p.amount, 0);
-                const generalPaid = laborPayments.filter(p => p.recipient === "General").reduce((sum, p) => sum + p.amount, 0);
-
-                const splitRatio = totalLaborLiability > 0 
-                    ? { t: tailorLiability / totalLaborLiability, c1: cutter1Liability / totalLaborLiability, c2: cutter2Liability / totalLaborLiability }
-                    : { t: 1/3, c1: 1/3, c2: 1/3 };
-                
-                tailorPaid += generalPaid * splitRatio.t;
-                cutter1Paid += generalPaid * splitRatio.c1;
-                cutter2Paid += generalPaid * splitRatio.c2;
-
-                tailorOutstandingBalance = tailorLiability - tailorPaid;
-                cutter1OutstandingBalance = cutter1Liability - cutter1Paid;
-                cutter2OutstandingBalance = cutter2Liability - cutter2Paid;
-                const totalLaborOutstanding = tailorOutstandingBalance + cutter1OutstandingBalance + cutter2OutstandingBalance;
-
-                document.getElementById("tailor-incurred").textContent = formatPHP(tailorLiability);
-                document.getElementById("cutter1-incurred").textContent = formatPHP(cutter1Liability);
-                document.getElementById("cutter2-incurred").textContent = formatPHP(cutter2Liability);
-                document.getElementById("tailor-paid").textContent = formatPHP(tailorPaid);
-                document.getElementById("cutter1-paid").textContent = formatPHP(cutter1Paid);
-                document.getElementById("cutter2-paid").textContent = formatPHP(cutter2Paid);
-                
-                const tailorOutstandingEl = document.getElementById("tailor-outstanding");
-                tailorOutstandingEl.textContent = formatPHP(tailorOutstandingBalance);
-                tailorOutstandingEl.className = `text-lg font-extrabold mt-2 ${tailorOutstandingBalance > 0 ? "text-red-700" : "text-green-600"}`;
-
-                const cutter1OutstandingEl = document.getElementById("cutter1-outstanding");
-                cutter1OutstandingEl.textContent = formatPHP(cutter1OutstandingBalance);
-                cutter1OutstandingEl.className = `text-lg font-extrabold mt-2 ${cutter1OutstandingBalance > 0 ? "text-red-700" : "text-green-600"}`;
-                
-                const cutter2OutstandingEl = document.getElementById("cutter2-outstanding");
-                cutter2OutstandingEl.textContent = formatPHP(cutter2OutstandingBalance);
-                cutter2OutstandingEl.className = `text-lg font-extrabold mt-2 ${cutter2OutstandingBalance > 0 ? "text-red-700" : "text-green-600"}`;
-                
-                const totalOutstandingEl = document.getElementById("labor-outstanding");
-                totalOutstandingEl.textContent = formatPHP(totalLaborOutstanding);
-                totalOutstandingEl.className = `text-4xl font-extrabold ${totalLaborOutstanding > 0 ? "text-red-500" : "text-green-600"}`;
-                 document.getElementById("dashboard-pending-payout").textContent = formatPHP(totalLaborOutstanding);
-            });
-
+            
             // Calculations for the filtered date range
-            dailyRecords.forEach(rec => {
+            filteredRecords.forEach(rec => {
                 totalRevenue += (rec.productsSold || 0) * appCosts.sellingPrice;
                 totalCOGS += (rec.productsSold || 0) * appCosts.materialCost;
             });
             
-            const totalOtherExpenses = expenses.reduce((sum, exp) => sum + (exp.amount || 0), 0);
-            const totalLaborInRange = dailyRecords.reduce((sum, rec) => sum + ((rec.tailoredCovers || 0) * appCosts.tailorRate) + ((rec.coverCuts || 0) * appCosts.cutter1Rate) + ((rec.foamCuts || 0) * appCosts.cutter2Rate), 0);
+            const totalOtherExpenses = filteredExpenses.reduce((sum, exp) => sum + (exp.amount || 0), 0);
+            const totalLaborInRange = filteredRecords.reduce((sum, rec) => sum + ((rec.tailoredCovers || 0) * appCosts.tailorRate) + ((rec.coverCuts || 0) * appCosts.cutter1Rate) + ((rec.foamCuts || 0) * appCosts.cutter2Rate), 0);
             const netProfit = totalRevenue - totalCOGS - totalLaborInRange - totalOtherExpenses;
 
             // --- Update DOM ---
@@ -833,8 +934,8 @@
                 ownerSharesContainer.appendChild(div);
             });
 
-            renderSalesChart(dailyRecords, startDate, endDate);
-            renderExpenseChart(expenses);
+            renderSalesChart(filteredRecords, startDate, endDate);
+            renderExpenseChart(filteredExpenses);
         };
         
         const renderSalesChart = (records, startDate, endDate) => {
@@ -984,6 +1085,18 @@
                 if (quantity > 0) cutCoversByDesign[input.dataset.designName] = quantity;
             });
 
+            const assembledMattressesByDesign = {};
+            document.querySelectorAll('#assembled-design-inputs input[type="number"]').forEach(input => {
+                const quantity = parseInt(input.value || 0);
+                if (quantity > 0) assembledMattressesByDesign[input.dataset.designName] = quantity;
+            });
+
+            const soldMattressesByDesign = {};
+            document.querySelectorAll('#sold-design-inputs input[type="number"]').forEach(input => {
+                const quantity = parseInt(input.value || 0);
+                if (quantity > 0) soldMattressesByDesign[input.dataset.designName] = quantity;
+            });
+
             const newData = {
                 tailoredCovers: parseInt(form.tailoredCovers.value || 0),
                 sewnCoversByDesign: sewnCoversByDesign,
@@ -991,11 +1104,19 @@
                 cutCoversByDesign: cutCoversByDesign,
                 foamCuts: parseInt(form.foamCuts.value || 0),
                 completedMattresses: parseInt(form.completedMattresses.value || 0),
+                assembledMattressesByDesign: assembledMattressesByDesign,
                 productsSold: parseInt(form.productsSold.value || 0),
+                soldMattressesByDesign: soldMattressesByDesign,
             };
             const statusEl = document.getElementById("status-message-daily");
 
-            if (!date || (newData.tailoredCovers === 0 && newData.coverCuts === 0 && newData.foamCuts === 0 && newData.completedMattresses === 0 && newData.productsSold === 0)) {
+            const totalInputs = Object.values(newData).reduce((sum, val) => {
+                if (typeof val === 'number') return sum + val;
+                if (typeof val === 'object') return sum + Object.values(val).reduce((s, v) => s + v, 0);
+                return sum;
+            }, 0);
+
+            if (!date || totalInputs === 0) {
                 statusEl.textContent = "🐥 Please select a date and enter at least one value.";
                 statusEl.className = "text-sm text-red-600";
                 return;
@@ -1005,6 +1126,18 @@
                 statusEl.textContent = "Saving...";
                 statusEl.className = "text-sm text-gray-500";
                 
+                const calculateMapDiff = (newMap, oldMap) => {
+                    const diff = {};
+                    const allKeys = new Set([...Object.keys(newMap || {}), ...Object.keys(oldMap || {})]);
+                    allKeys.forEach(key => {
+                        const diffValue = (newMap?.[key] || 0) - (oldMap?.[key] || 0);
+                        if (diffValue !== 0) {
+                            diff[key] = diffValue;
+                        }
+                    });
+                    return diff;
+                };
+
                 await runTransaction(db, async (transaction) => {
                     const inventoryRef = doc(db, INVENTORY_DOC_PATH);
                     const recordRef = doc(db, DAILY_RECORDS_COLLECTION, date);
@@ -1015,85 +1148,76 @@
                     ]);
 
                     const inv = inventorySnap.exists() ? inventorySnap.data() : {};
-                    const oldData = recordSnap.exists() ? recordSnap.data() : { consumedDesigns: {} };
+                    const oldData = recordSnap.exists() ? recordSnap.data() : {};
 
                     const cutStock = { ...(inv.cutCoversByDesign || {}) };
                     const sewnStock = { ...(inv.coverDesigns || {}) };
+                    const finishedStock = { ...(inv.finishedProductsByDesign || {}) };
 
-                    const oldCutDesigns = oldData.cutCoversByDesign || {};
-                    const allCutDesigns = new Set([...Object.keys(newData.cutCoversByDesign), ...Object.keys(oldCutDesigns)]);
-                    allCutDesigns.forEach(design => {
-                        const diff = (newData.cutCoversByDesign[design] || 0) - (oldCutDesigns[design] || 0);
-                        cutStock[design] = (cutStock[design] || 0) + diff;
+                    // 1. Handle Cover Cuts (adds to cutStock)
+                    const cutDiff = calculateMapDiff(newData.cutCoversByDesign, oldData.cutCoversByDesign);
+                    Object.entries(cutDiff).forEach(([design, qty]) => {
+                        cutStock[design] = (cutStock[design] || 0) + qty;
                     });
 
-                    const oldSewnDesigns = oldData.sewnCoversByDesign || {};
-                    const allSewnDesigns = new Set([...Object.keys(newData.sewnCoversByDesign), ...Object.keys(oldSewnDesigns)]);
-                    allSewnDesigns.forEach(design => {
-                        const diff = (newData.sewnCoversByDesign[design] || 0) - (oldSewnDesigns[design] || 0);
-                        cutStock[design] = (cutStock[design] || 0) - diff;
-                        sewnStock[design] = (sewnStock[design] || 0) + diff;
+                    // 2. Handle Covers Sewn (moves from cutStock to sewnStock)
+                    const sewnDiff = calculateMapDiff(newData.sewnCoversByDesign, oldData.sewnCoversByDesign);
+                    Object.entries(sewnDiff).forEach(([design, qty]) => {
+                        sewnStock[design] = (sewnStock[design] || 0) + qty;
+                        cutStock[design] = (cutStock[design] || 0) - qty; // Consume cut stock
+                        if (cutStock[design] < 0) throw new Error(`Not enough cut stock for "${design}" to sew ${qty}.`);
                     });
 
-                    const completedDiff = newData.completedMattresses - (oldData.completedMattresses || 0);
-                    let consumedForThisTx = {};
-
-                    if (completedDiff > 0) {
-                        let remainingToConsume = completedDiff;
-                        const sortedSewnStock = Object.entries(sewnStock).filter(([, qty]) => qty > 0).sort(([, qtyA], [, qtyB]) => qtyB - qtyA);
-                        for (const [design, qty] of sortedSewnStock) {
-                            const consumed = Math.min(remainingToConsume, qty);
-                            sewnStock[design] -= consumed;
-                            consumedForThisTx[design] = (consumedForThisTx[design] || 0) + consumed;
-                            remainingToConsume -= consumed;
-                            if (remainingToConsume <= 0) break;
-                        }
-                        if (remainingToConsume > 0) {
-                            throw new Error(`Not enough sewn covers in stock to assemble ${completedDiff} mattresses.`);
-                        }
-                    } else if (completedDiff < 0) {
-                        const oldConsumed = oldData.consumedDesigns || {};
-                        let amountToReturn = Math.abs(completedDiff);
-                        const sortedOldConsumed = Object.entries(oldConsumed).sort(([, qtyA], [, qtyB]) => qtyB - qtyA);
-                        for (const [design, consumedQty] of sortedOldConsumed) {
-                            const canReturn = Math.min(amountToReturn, consumedQty);
-                            sewnStock[design] = (sewnStock[design] || 0) + canReturn;
-                            consumedForThisTx[design] = (consumedForThisTx[design] || 0) - canReturn;
-                            amountToReturn -= canReturn;
-                            if (amountToReturn <= 0) break;
-                        }
-                    }
-                    
-                    const finalConsumedDesigns = { ...(oldData.consumedDesigns || {}) };
-                    Object.entries(consumedForThisTx).forEach(([design, qty]) => {
-                        finalConsumedDesigns[design] = (finalConsumedDesigns[design] || 0) + qty;
-                        if (finalConsumedDesigns[design] <= 0) delete finalConsumedDesigns[design];
+                    // 3. Handle Mattresses Assembled (moves from sewnStock to finishedStock)
+                    const assembledDiff = calculateMapDiff(newData.assembledMattressesByDesign, oldData.assembledMattressesByDesign);
+                    let totalAssembledDiff = 0;
+                    Object.entries(assembledDiff).forEach(([design, qty]) => {
+                        finishedStock[design] = (finishedStock[design] || 0) + qty;
+                        sewnStock[design] = (sewnStock[design] || 0) - qty; // Consume sewn stock
+                        if (sewnStock[design] < 0) throw new Error(`Not enough sewn covers for "${design}" to assemble ${qty}.`);
+                        totalAssembledDiff += qty;
                     });
 
-                    const foamCutsDiff = newData.foamCuts - (oldData.foamCuts || 0);
-                    const soldDiff = newData.productsSold - (oldData.productsSold || 0);
-                    const newFoamStock = (inv.stockFoamCut || 0) + foamCutsDiff - completedDiff;
-                    const newFinishedStock = (inv.stockFinishedProducts || 0) + completedDiff - soldDiff;
+                    // 4. Handle Products Sold (removes from finishedStock)
+                    const soldDiff = calculateMapDiff(newData.soldMattressesByDesign, oldData.soldMattressesByDesign);
+                    Object.entries(soldDiff).forEach(([design, qty]) => {
+                        finishedStock[design] = (finishedStock[design] || 0) - qty;
+                        if (finishedStock[design] < 0) throw new Error(`Not enough finished stock for "${design}" to sell ${qty}.`);
+                    });
+
+                    // 5. Update Foam Stock
+                    const foamCutsDiff = (newData.foamCuts || 0) - (oldData.foamCuts || 0);
+                    const newFoamStock = (inv.stockFoamCut || 0) + foamCutsDiff - totalAssembledDiff;
+
+                    // 6. Recalculate all totals from the design maps
+                    const newTotalCut = Object.values(cutStock).reduce((a, b) => a + b, 0);
+                    const newTotalSewn = Object.values(sewnStock).reduce((a, b) => a + b, 0);
+                    const newTotalFinished = Object.values(finishedStock).reduce((a, b) => a + b, 0);
 
                     const updatedInventory = {
                         ...inv,
                         cutCoversByDesign: cutStock,
                         coverDesigns: sewnStock,
+                        finishedProductsByDesign: finishedStock,
                         stockFoamCut: Math.max(0, newFoamStock),
-                        stockFinishedProducts: Math.max(0, newFinishedStock),
-                        stockCoverCut: Math.max(0, Object.values(cutStock).reduce((a, b) => a + b, 0)),
-                        stockTailoredCovers: Math.max(0, Object.values(sewnStock).reduce((a, b) => a + b, 0)),
+                        stockCoverCut: Math.max(0, newTotalCut),
+                        stockTailoredCovers: Math.max(0, newTotalSewn),
+                        stockFinishedProducts: Math.max(0, newTotalFinished),
                     };
                     
                     transaction.set(inventoryRef, updatedInventory);
-                    transaction.set(recordRef, { ...newData, date, timestamp: serverTimestamp(), consumedDesigns: finalConsumedDesigns });
+                    transaction.set(recordRef, { ...newData, date, timestamp: serverTimestamp() });
                 });
 
                 statusEl.textContent = `✨ Daily entry for ${date} UPDATED successfully!`;
                 statusEl.className = "text-sm text-green-600";
                 form.reset();
-                document.querySelectorAll('#tailor-design-inputs input, #processor-design-inputs input, #foamCuts').forEach(input => input.value = 0);
+                 document.querySelectorAll('#tailor-design-inputs input, #processor-design-inputs input, #assembled-design-inputs input, #sold-design-inputs input, #foamCuts').forEach(input => input.value = 0);
                 document.getElementById('date').value = getTodayDate();
+                ['tailoredCovers', 'coverCuts', 'completedMattresses', 'productsSold'].forEach(id => {
+                    document.getElementById(id).value = 0;
+                    document.getElementById(id+'-total-display').textContent = 0;
+                });
 
             } catch (error) {
                 console.error("Error in daily entry transaction:", error);
@@ -1136,6 +1260,30 @@
                 console.error("Error logging salary payment:", error);
                 statusEl.textContent = `Payment failed: ${error.message}.`;
                 statusEl.className = "text-sm text-red-600";
+            }
+        };
+        
+        const handleLaborAdjustment = async (event) => {
+            event.preventDefault();
+            const form = document.getElementById('adjustment-form');
+            const data = {
+                amount: parseFloat(form.adjustmentAmount.value),
+                recipient: form.adjustmentRecipient.value,
+                notes: form.adjustmentNotes.value.trim(),
+            };
+            
+            if (isNaN(data.amount) || data.amount <= 0 || !data.recipient) {
+                // Should not happen with validation but good to have
+                return;
+            }
+
+            try {
+                await addDoc(collection(db, LABOR_ADJUSTMENTS_COLLECTION), { ...data, timestamp: serverTimestamp() });
+                document.getElementById('adjustment-modal').classList.add('hidden');
+                form.reset();
+            } catch (error) {
+                console.error("Error logging labor adjustment:", error);
+                showAlertModal('Error', `Could not save adjustment: ${error.message}`);
             }
         };
 
@@ -1300,38 +1448,55 @@
                             
                             const cutStock = { ...(inv.cutCoversByDesign || {}) };
                             const sewnStock = { ...(inv.coverDesigns || {}) };
-                            
+                            const finishedStock = { ...(inv.finishedProductsByDesign || {}) };
+
+                            // Reverse Cover Cuts
                             const cutDesignsInRecord = recordData.cutCoversByDesign || {};
-                            Object.keys(cutDesignsInRecord).forEach(design => {
-                                cutStock[design] = (cutStock[design] || 0) - (cutDesignsInRecord[design] || 0);
+                            Object.entries(cutDesignsInRecord).forEach(([design, qty]) => {
+                                cutStock[design] = (cutStock[design] || 0) - qty;
                             });
 
+                            // Reverse Covers Sewn
                             const sewnDesignsInRecord = recordData.sewnCoversByDesign || {};
-                            Object.keys(sewnDesignsInRecord).forEach(design => {
-                                const qty = sewnDesignsInRecord[design] || 0;
-                                cutStock[design] = (cutStock[design] || 0) + qty;
+                            Object.entries(sewnDesignsInRecord).forEach(([design, qty]) => {
                                 sewnStock[design] = (sewnStock[design] || 0) - qty;
+                                cutStock[design] = (cutStock[design] || 0) + qty;
                             });
 
-                            const consumedInRecord = recordData.consumedDesigns || {};
-                            for (const [design, qty] of Object.entries(consumedInRecord)) {
+                            // Reverse Mattresses Assembled
+                            const assembledDesignsInRecord = recordData.assembledMattressesByDesign || {};
+                            let totalAssembledInRecord = 0;
+                            Object.entries(assembledDesignsInRecord).forEach(([design, qty]) => {
+                                finishedStock[design] = (finishedStock[design] || 0) - qty;
                                 sewnStock[design] = (sewnStock[design] || 0) + qty;
-                            }
+                                totalAssembledInRecord += qty;
+                            });
 
-                            const completedInRecord = recordData.completedMattresses || 0;
-                            const coverCutsInRecord = recordData.coverCuts || 0;
+                            // Reverse Products Sold
+                            const soldDesignsInRecord = recordData.soldMattressesByDesign || {};
+                            Object.entries(soldDesignsInRecord).forEach(([design, qty]) => {
+                                finishedStock[design] = (finishedStock[design] || 0) + qty;
+                            });
+
+                            // Reverse Foam Cuts & Consumption
                             const foamCutsInRecord = recordData.foamCuts || 0;
-                            const soldInRecord = recordData.productsSold || 0;
+                            const newFoamStock = (inv.stockFoamCut || 0) - foamCutsInRecord + totalAssembledInRecord;
                             
-                            // Reversing the logic: Add back used stock, remove produced stock
-                            const newFoamStock = (inv.stockFoamCut || 0) - foamCutsInRecord + completedInRecord;
-                            const newFinishedStock = (inv.stockFinishedProducts || 0) - completedInRecord + soldInRecord;
+                            // Recalculate totals
+                            const newTotalCut = Object.values(cutStock).reduce((a, b) => a + b, 0);
+                            const newTotalSewn = Object.values(sewnStock).reduce((a, b) => a + b, 0);
+                            const newTotalFinished = Object.values(finishedStock).reduce((a, b) => a + b, 0);
 
-                            const updatedInventory = { ...inv, cutCoversByDesign: cutStock, coverDesigns: sewnStock };
-                            updatedInventory.stockFoamCut = Math.max(0, newFoamStock);
-                            updatedInventory.stockFinishedProducts = Math.max(0, newFinishedStock);
-                            updatedInventory.stockCoverCut = Math.max(0, Object.values(cutStock).reduce((a, b) => a + b, 0));
-                            updatedInventory.stockTailoredCovers = Math.max(0, Object.values(sewnStock).reduce((a, b) => a + b, 0));
+                            const updatedInventory = { 
+                                ...inv, 
+                                cutCoversByDesign: cutStock, 
+                                coverDesigns: sewnStock,
+                                finishedProductsByDesign: finishedStock,
+                                stockFoamCut: Math.max(0, newFoamStock),
+                                stockCoverCut: Math.max(0, newTotalCut),
+                                stockTailoredCovers: Math.max(0, newTotalSewn),
+                                stockFinishedProducts: Math.max(0, newTotalFinished),
+                            };
                             
                             transaction.set(inventoryRef, updatedInventory);
                             transaction.delete(recordRef);
@@ -1361,8 +1526,17 @@
                     const inventoryRef = doc(db, INVENTORY_DOC_PATH);
                     const inventorySnap = await transaction.get(inventoryRef);
                     const invData = inventorySnap.exists() ? inventorySnap.data() : {};
+                    
                     const newSewnDesigns = { ...(invData.coverDesigns || {}), [designName]: initialStock };
-                    transaction.set(inventoryRef, { ...invData, coverDesigns: newSewnDesigns }, { merge: true });
+                    const newCutDesigns = { ...(invData.cutCoversByDesign || {}), [designName]: invData.cutCoversByDesign?.[designName] || 0 };
+                    const newFinishedDesigns = { ...(invData.finishedProductsByDesign || {}), [designName]: invData.finishedProductsByDesign?.[designName] || 0 };
+
+                    transaction.set(inventoryRef, { 
+                        ...invData, 
+                        coverDesigns: newSewnDesigns,
+                        cutCoversByDesign: newCutDesigns,
+                        finishedProductsByDesign: newFinishedDesigns
+                    }, { merge: true });
                 });
                 statusEl.textContent = `🎉 Design '${designName}' added successfully!`;
                 statusEl.className = "text-sm text-green-600 block";
@@ -1393,6 +1567,8 @@
                     const invData = inventorySnap.data();
                     const newCoverDesigns = { ...(invData.coverDesigns || {}) };
                     const newCutDesigns = { ...(invData.cutCoversByDesign || {}) };
+                    const newFinishedDesigns = { ...(invData.finishedProductsByDesign || {}) };
+
 
                     if (newCoverDesigns.hasOwnProperty(oldName)) {
                         newCoverDesigns[newName] = newCoverDesigns[oldName];
@@ -1402,8 +1578,12 @@
                         newCutDesigns[newName] = newCutDesigns[oldName];
                         delete newCutDesigns[oldName];
                     }
+                    if (newFinishedDesigns.hasOwnProperty(oldName)) {
+                        newFinishedDesigns[newName] = newFinishedDesigns[oldName];
+                        delete newFinishedDesigns[oldName];
+                    }
                     
-                    transaction.set(inventoryRef, { ...invData, coverDesigns: newCoverDesigns, cutCoversByDesign: newCutDesigns });
+                    transaction.set(inventoryRef, { ...invData, coverDesigns: newCoverDesigns, cutCoversByDesign: newCutDesigns, finishedProductsByDesign: newFinishedDesigns });
                 });
                 document.getElementById('edit-design-modal').classList.add('hidden');
             } catch (error) {
@@ -1415,7 +1595,7 @@
         const handleDeleteDesign = (designName) => {
             showConfirmationModal(
                 '🗑️ Delete Design',
-                `Are you sure you want to delete the design "${designName}"? This will remove it from sewn and cut stock lists. This cannot be undone.`,
+                `Are you sure you want to delete the design "${designName}"? This will remove it from all stock lists. This cannot be undone.`,
                 async () => {
                     try {
                         await runTransaction(db, async (transaction) => {
@@ -1426,19 +1606,24 @@
                             const invData = inventorySnap.data();
                             const newCoverDesigns = { ...(invData.coverDesigns || {}) };
                             const newCutDesigns = { ...(invData.cutCoversByDesign || {}) };
+                            const newFinishedDesigns = { ...(invData.finishedProductsByDesign || {}) };
 
                             delete newCoverDesigns[designName];
                             delete newCutDesigns[designName];
+                            delete newFinishedDesigns[designName];
 
                             const newTotalSewn = Object.values(newCoverDesigns).reduce((a, b) => a + b, 0);
                             const newTotalCut = Object.values(newCutDesigns).reduce((a, b) => a + b, 0);
+                            const newTotalFinished = Object.values(newFinishedDesigns).reduce((a, b) => a + b, 0);
 
                             transaction.set(inventoryRef, { 
                                 ...invData, 
                                 coverDesigns: newCoverDesigns, 
                                 cutCoversByDesign: newCutDesigns,
+                                finishedProductsByDesign: newFinishedDesigns,
                                 stockTailoredCovers: newTotalSewn,
-                                stockCoverCut: newTotalCut
+                                stockCoverCut: newTotalCut,
+                                stockFinishedProducts: newTotalFinished
                             });
                         });
                     } catch (error) {
@@ -1454,6 +1639,20 @@
             document.getElementById('old-design-name').value = oldName;
             document.getElementById('new-design-name').value = oldName;
             document.getElementById('edit-design-modal-title').textContent = `Edit "${oldName}"`;
+        };
+        
+        const openAdjustmentModal = (recipient) => {
+            const modal = document.getElementById('adjustment-modal');
+            modal.classList.remove('hidden');
+            document.getElementById('adjustment-modal-title').textContent = `Adjust Balance for ${recipient}`;
+            document.getElementById('adjustmentRecipient').value = recipient;
+            
+            let outstanding = 0;
+            if (recipient === "Tailor") outstanding = tailorOutstandingBalance;
+            else if (recipient === "Cutter 1") outstanding = cutter1OutstandingBalance;
+            else if (recipient === "Cutter 2") outstanding = cutter2OutstandingBalance;
+
+            document.getElementById('adjustmentAmount').value = Math.max(0, outstanding).toFixed(2);
         };
 
 
@@ -1562,7 +1761,26 @@
                 return;
             }
 
-            const fieldToUpdate = type === 'sewn' ? 'coverDesigns' : 'cutCoversByDesign';
+            let fieldToUpdate = '';
+            let totalFieldToUpdate = '';
+            let typeName = '';
+
+            if (type === 'sewn') {
+                fieldToUpdate = 'coverDesigns';
+                totalFieldToUpdate = 'stockTailoredCovers';
+                typeName = 'Sewn';
+            } else if (type === 'cut') {
+                fieldToUpdate = 'cutCoversByDesign';
+                totalFieldToUpdate = 'stockCoverCut';
+                typeName = 'Cut';
+            } else if (type === 'finished') {
+                fieldToUpdate = 'finishedProductsByDesign';
+                totalFieldToUpdate = 'stockFinishedProducts';
+                typeName = 'Finished';
+            } else {
+                console.error("Invalid stock type for update:", type);
+                return;
+            }
 
             try {
                 await runTransaction(db, async (transaction) => {
@@ -1572,16 +1790,12 @@
                     const newDesigns = { ...(invData[fieldToUpdate] || {}), [designName]: stock };
                     const updatedData = { ...invData, [fieldToUpdate]: newDesigns };
 
-                    // Recalculate totals
-                    if(type === 'sewn') {
-                        updatedData.stockTailoredCovers = Object.values(newDesigns).reduce((a, b) => a + b, 0);
-                    } else {
-                        updatedData.stockCoverCut = Object.values(newDesigns).reduce((a, b) => a + b, 0);
-                    }
+                    // Recalculate total for the specific field
+                    updatedData[totalFieldToUpdate] = Object.values(newDesigns).reduce((a, b) => a + b, 0);
                     
                     transaction.set(inventoryRef, updatedData);
                 });
-                statusEl.textContent = `✨ ${type === 'sewn' ? 'Sewn' : 'Cut'} stock for '${designName}' updated!`;
+                statusEl.textContent = `✨ ${typeName} stock for '${designName}' updated!`;
                 statusEl.className = "text-sm text-green-600 block";
             } catch (error) {
                 console.error(`Error updating ${type} design stock:`, error);
@@ -1631,9 +1845,7 @@
             switchTab("productivity");
             document.getElementById("date").value = record.date;
             document.getElementById("foamCuts").value = record.foamCuts || 0;
-            document.getElementById("completedMattresses").value = record.completedMattresses;
-            document.getElementById("productsSold").value = record.productsSold;
-
+            
             document.querySelectorAll('#tailor-design-inputs input[type="number"]').forEach(input => {
                 input.value = record.sewnCoversByDesign?.[input.dataset.designName] || 0;
             });
@@ -1643,6 +1855,16 @@
                 input.value = record.cutCoversByDesign?.[input.dataset.designName] || 0;
             });
             document.getElementById('processor-design-inputs').dispatchEvent(new Event('input'));
+
+            document.querySelectorAll('#assembled-design-inputs input[type="number"]').forEach(input => {
+                input.value = record.assembledMattressesByDesign?.[input.dataset.designName] || 0;
+            });
+            document.getElementById('assembled-design-inputs').dispatchEvent(new Event('input'));
+
+            document.querySelectorAll('#sold-design-inputs input[type="number"]').forEach(input => {
+                input.value = record.soldMattressesByDesign?.[input.dataset.designName] || 0;
+            });
+            document.getElementById('sold-design-inputs').dispatchEvent(new Event('input'));
 
 
             const statusEl = document.getElementById("status-message-daily");
@@ -1782,6 +2004,29 @@
         </div>
     </div>
 
+    <!-- Adjustment Modal -->
+    <div id="adjustment-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 id="adjustment-modal-title" class="text-xl font-bold mb-3 pink-text">Adjust Balance</h3>
+            <form id="adjustment-form">
+                <input type="hidden" id="adjustmentRecipient">
+                <div>
+                    <label for="adjustmentAmount" class="block text-sm font-medium brown-text">Amount to Adjust</label>
+                    <input type="number" id="adjustmentAmount" min="0.01" step="0.01" required class="mt-1 block w-full rounded-lg input-style">
+                </div>
+                <div class="mt-4">
+                    <label for="adjustmentNotes" class="block text-sm font-medium brown-text">Notes / Reason</label>
+                    <input type="text" id="adjustmentNotes" required class="mt-1 block w-full rounded-lg input-style" placeholder="e.g., Owner contribution">
+                </div>
+                <div class="flex justify-end space-x-3 mt-4">
+                    <button type="button" id="modal-cancel-adjustment-btn" class="btn-cancel px-4 py-2 rounded-lg">Cancel</button>
+                    <button type="submit" class="btn-primary px-4 py-2 rounded-lg">Save Adjustment</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+
     <!-- MAIN TRACKER CONTAINER -->
     <div id="tracker-container" class="hidden w-full">
         <header class="text-center mb-6">
@@ -1830,7 +2075,7 @@
                             <p id="dashboard-pending-orders" class="text-4xl font-extrabold text-yellow-600 mt-2">0</p>
                         </div>
                         <!-- Inventory -->
-                         <div class="cute-card bg-blue-100 border-blue-300 p-6 md:col-span-2 lg:col-span-3">
+                         <div class="cute-card bg-blue-100 border-blue-300 p-6 md:col-span-2 lg:grid-cols-3">
                              <h3 class="text-xl font-bold text-blue-800 mb-4 text-center">Inventory At-a-Glance</h3>
                              <div class="grid grid-cols-2 gap-4">
                                  <div class="text-center bg-white/50 p-4 rounded-lg">
@@ -1844,7 +2089,7 @@
                              </div>
                         </div>
                          <!-- Low Stock Alerts -->
-                        <div id="dashboard-low-stock-alerts" class="cute-card bg-orange-100 border-orange-300 p-6 md:col-span-2 lg:col-span-3">
+                        <div id="dashboard-low-stock-alerts" class="cute-card bg-orange-100 border-orange-300 p-6 md:col-span-2 lg:grid-cols-3">
                             <h3 class="text-xl font-bold text-orange-800 mb-4 text-center">🚨 Low Stock Alerts</h3>
                             <div id="low-stock-list" class="space-y-2">
                                 <p class="text-center text-gray-500 italic">No low stock items. Great job!</p>
@@ -1866,7 +2111,7 @@
                             </div>
                             <div class="pt-2 border-t border-pink-accent/30">
                                 <p class="text-sm font-bold brown-text mb-1">Employee Output</p>
-                                <label class="block text-sm font-medium brown-text">Cutter 1: Cover Cuts by Design (@ P<span class="cutter1-rate-display">8</span>)</label>
+                                <label class="block text-sm font-medium brown-text">Cutter 1: Cover Cuts by Design (@ P<span class="cutter1-rate-display">8</span>) <span class="font-extrabold float-right">Total: <span id="coverCuts-total-display">0</span></span></label>
                                 <div id="processor-design-inputs" class="space-y-2 mt-1 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
                                     <p class="text-sm text-center italic text-gray-500">Loading designs...</p>
                                 </div>
@@ -1875,7 +2120,7 @@
                                 <label for="foamCuts" class="block text-sm font-medium brown-text mt-3">Cutter 2: Foam Cuts (@ P<span class="cutter2-rate-display">8</span>)</label>
                                 <input type="number" id="foamCuts" name="foamCuts" min="0" value="0" class="mt-1 block w-full rounded-lg input-style" placeholder="0">
                                 
-                                <label class="block text-sm font-bold brown-text mt-3">Tailor: Covers Sewn by Design (@ P<span class="tailor-rate-display">17</span>)</label>
+                                <label class="block text-sm font-bold brown-text mt-3">Tailor: Covers Sewn by Design (@ P<span class="tailor-rate-display">17</span>) <span class="font-extrabold float-right">Total: <span id="tailoredCovers-total-display">0</span></span></label>
                                 <div id="tailor-design-inputs" class="space-y-2 mt-1 p-3 bg-pink-50 border border-pink-200 rounded-lg">
                                     <p class="text-sm text-center italic text-gray-500">Loading designs...</p>
                                 </div>
@@ -1883,10 +2128,17 @@
                             </div>
                             <div class="pt-2 border-t border-pink-accent/30">
                                 <p class="text-sm font-bold brown-text mb-1">Final Product Tracking</p>
-                                <label for="completedMattresses" class="block text-sm font-medium brown-text">Mattresses Assembled</label>
-                                <input type="number" id="completedMattresses" name="completedMattresses" min="0" value="0" class="mt-1 block w-full rounded-lg input-style" placeholder="0">
-                                <label for="productsSold" class="block text-sm font-medium brown-text mt-3">Products Sold (Units @ P<span class="selling-price-display">220</span>)</label>
-                                <input type="number" id="productsSold" name="productsSold" min="0" value="0" class="mt-1 block w-full rounded-lg input-style" placeholder="0">
+                                <label class="block text-sm font-bold brown-text">Mattresses Assembled by Design <span class="font-extrabold float-right">Total: <span id="completedMattresses-total-display">0</span></span></label>
+                                <div id="assembled-design-inputs" class="space-y-2 mt-1 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                                    <p class="text-sm text-center italic text-gray-500">Loading designs...</p>
+                                </div>
+                                <input type="hidden" id="completedMattresses" name="completedMattresses" value="0">
+                                
+                                <label class="block text-sm font-bold brown-text mt-3">Products Sold by Design (@ P<span class="selling-price-display">220</span>) <span class="font-extrabold float-right">Total: <span id="productsSold-total-display">0</span></span></label>
+                                <div id="sold-design-inputs" class="space-y-2 mt-1 p-3 bg-green-50 border border-green-200 rounded-lg">
+                                    <p class="text-sm text-center italic text-gray-500">Loading designs...</p>
+                                </div>
+                                <input type="hidden" id="productsSold" name="productsSold" value="0">
                             </div>
                             <p id="status-message-daily" class="text-sm font-medium pt-2"></p>
                             <button type="submit" class="w-full btn-primary py-3 rounded-lg font-semibold text-lg shadow-md">Log Daily Chirps</button>
@@ -1946,19 +2198,40 @@
                             <p class="font-bold text-lg pink-text">Tailor Status (P<span class="tailor-rate-display">17</span>/cover)</p>
                             <div class="flex justify-between text-sm mt-1"><span>Liability Incurred:</span><span id="tailor-incurred" class="font-medium text-red-600">P0.00</span></div>
                             <div class="flex justify-between text-sm"><span>Total Paid Out:</span><span id="tailor-paid" class="font-medium text-green-600">P0.00</span></div>
-                            <div class="flex justify-between font-extrabold mt-2"><span>PENDING PAYOUT:</span><span id="tailor-outstanding" class="text-lg text-red-700">P0.00</span></div>
+                            <div class="flex justify-between text-sm"><span>Adjustments:</span><span id="tailor-adjusted" class="font-medium text-blue-600">P0.00</span></div>
+                            <div class="flex justify-between font-extrabold mt-2 border-t border-pink-300 pt-2">
+                                <span>PENDING PAYOUT:</span>
+                                <div class="flex items-center gap-2">
+                                    <span id="tailor-outstanding" class="text-lg text-red-700">P0.00</span>
+                                    <button data-recipient="Tailor" class="adjust-balance-btn text-xs bg-blue-200 text-blue-800 px-2 py-0.5 rounded-full hover:bg-blue-300">Adjust</button>
+                                </div>
+                            </div>
                         </div>
                         <div class="bg-yellow-100 p-4 rounded-xl shadow-md mb-4 border border-yellow-text">
                             <p class="font-bold text-lg yellow-text">Cutter 1 (Cover) Status (P<span class="cutter1-rate-display">8</span>/cut)</p>
                             <div class="flex justify-between text-sm mt-1"><span>Liability Incurred:</span><span id="cutter1-incurred" class="font-medium text-red-600">P0.00</span></div>
                             <div class="flex justify-between text-sm"><span>Total Paid Out:</span><span id="cutter1-paid" class="font-medium text-green-600">P0.00</span></div>
-                            <div class="flex justify-between font-extrabold mt-2"><span>PENDING PAYOUT:</span><span id="cutter1-outstanding" class="text-lg text-red-700">P0.00</span></div>
+                            <div class="flex justify-between text-sm"><span>Adjustments:</span><span id="cutter1-adjusted" class="font-medium text-blue-600">P0.00</span></div>
+                             <div class="flex justify-between font-extrabold mt-2 border-t border-yellow-300 pt-2">
+                                <span>PENDING PAYOUT:</span>
+                                <div class="flex items-center gap-2">
+                                    <span id="cutter1-outstanding" class="text-lg text-red-700">P0.00</span>
+                                    <button data-recipient="Cutter 1" class="adjust-balance-btn text-xs bg-blue-200 text-blue-800 px-2 py-0.5 rounded-full hover:bg-blue-300">Adjust</button>
+                                </div>
+                            </div>
                         </div>
                         <div class="bg-yellow-100 p-4 rounded-xl shadow-md mb-6 border border-yellow-text">
                             <p class="font-bold text-lg yellow-text">Cutter 2 (Foam) Status (P<span class="cutter2-rate-display">8</span>/cut)</p>
                             <div class="flex justify-between text-sm mt-1"><span>Liability Incurred:</span><span id="cutter2-incurred" class="font-medium text-red-600">P0.00</span></div>
                             <div class="flex justify-between text-sm"><span>Total Paid Out:</span><span id="cutter2-paid" class="font-medium text-green-600">P0.00</span></div>
-                            <div class="flex justify-between font-extrabold mt-2"><span>PENDING PAYOUT:</span><span id="cutter2-outstanding" class="text-lg text-red-700">P0.00</span></div>
+                            <div class="flex justify-between text-sm"><span>Adjustments:</span><span id="cutter2-adjusted" class="font-medium text-blue-600">P0.00</span></div>
+                             <div class="flex justify-between font-extrabold mt-2 border-t border-yellow-300 pt-2">
+                                <span>PENDING PAYOUT:</span>
+                                 <div class="flex items-center gap-2">
+                                    <span id="cutter2-outstanding" class="text-lg text-red-700">P0.00</span>
+                                    <button data-recipient="Cutter 2" class="adjust-balance-btn text-xs bg-blue-200 text-blue-800 px-2 py-0.5 rounded-full hover:bg-blue-300">Adjust</button>
+                                </div>
+                            </div>
                         </div>
                         <div class="bg-yellow-300 p-5 rounded-lg shadow-inner text-center">
                             <p class="text-lg font-semibold brown-text">Total Company Liability</p>
@@ -2036,7 +2309,13 @@
                             <div class="flex justify-between items-center text-lg bg-white/70 p-3 rounded-lg shadow-sm"><span>Foam Cuts in Stock:</span><span id="stock-foam-cuts">0</span></div>
                             <div class="border-t-4 border-double border-yellow-400 mt-4 pt-3"></div>
                             <div class="flex justify-between items-center text-lg bg-white/70 p-3 rounded-lg shadow-sm"><span>Sewn Covers (Total):</span><span id="stock-tailored-covers">0</span></div>
-                            <div class="flex justify-between items-center text-lg bg-white/70 p-3 rounded-lg shadow-sm"><span>Finished Products Stock:</span><span id="stock-products" class="text-xl">0</span></div>
+                            <div class="flex justify-between items-center text-lg bg-white/70 p-3 rounded-lg shadow-sm"><span>Finished Products Stock (Total):</span><span id="stock-products" class="text-xl">0</span></div>
+                            <div class="pl-4 pr-2 py-2 space-y-1 bg-white/50 rounded-lg">
+                                <h4 class="text-sm font-semibold brown-text">Finished Stock by Design:</h4>
+                                <div id="finished-products-detail" class="space-y-1">
+                                    <p class="text-sm brown-text italic">No finished stock tracked yet.</p>
+                                </div>
+                            </div>
                         </div>
                         <div class="mt-6 pt-4 border-t-2 border-yellow-400">
                             <h3 class="font-bold brown-text mb-3">Manual Stock Adjustments</h3>
@@ -2046,19 +2325,14 @@
                                     <input type="number" id="manualFoamStock" class="w-20 text-center rounded-md border-gray-300 shadow-sm">
                                     <button id="updateFoamBtn" class="text-xs bg-yellow-300 text-brown-text px-3 py-1 rounded-full hover:bg-yellow-400 transition">Set</button>
                                 </div>
-                                <div class="flex items-center space-x-2">
-                                    <label class="flex-1 text-sm">Finished Products:</label>
-                                    <input type="number" id="manualFinishedStock" class="w-20 text-center rounded-md border-gray-300 shadow-sm">
-                                    <button id="updateFinishedBtn" class="text-xs bg-yellow-300 text-brown-text px-3 py-1 rounded-full hover:bg-yellow-400 transition">Set</button>
-                                </div>
                                 <p id="manual-stock-status" class="text-xs text-center pt-1"></p>
                             </div>
                         </div>
                     </div>
                     <div class="cute-card bg-light-yellow p-6 rounded-xl shadow-lg border-pink-accent">
-                        <h3 class="text-2xl font-bold pink-text card-header flex items-center"><span class="text-2xl mr-2">💖</span> Cover Design Manager</h3>
+                        <h3 class="text-2xl font-bold pink-text card-header flex items-center"><span class="text-2xl mr-2">💖</span> Design & Stock Manager</h3>
                         <div class="pt-3">
-                            <h4 class="text-sm font-semibold brown-text mb-2 flex items-center justify-between">Sewn Cover Designs<button id="cover-manager-toggle" class="text-xs bg-white text-brown-text px-3 py-1 rounded-full border border-yellow-text hover:bg-yellow-100 transition">Manage</button></h4>
+                            <h4 class="text-sm font-semibold brown-text mb-2 flex items-center justify-between">Sewn Cover Stock<button id="cover-manager-toggle" class="text-xs bg-white text-brown-text px-3 py-1 rounded-full border border-yellow-text hover:bg-yellow-100 transition">Manage</button></h4>
                             <div id="cover-designs-detail" class="space-y-1"></div>
                         </div>
                         <div class="pt-3 mt-4 border-t border-pink-200">
@@ -2066,6 +2340,9 @@
                             <div id="cut-covers-detail" class="space-y-1"></div>
                         </div>
                         <div id="cover-manager" class="hidden mt-4">
+                            <div class="p-3 bg-yellow-100 border border-yellow-300 rounded-lg text-center text-sm brown-text mb-4">
+                                <p><strong>Note:</strong> Manually adjusting stock counts here will only update your inventory levels. It does not affect productivity logs or salary calculations.</p>
+                            </div>
                             <p id="design-status-message" class="text-sm font-medium hidden pt-2 mb-4"></p>
                             <h4 class="font-semibold brown-text mb-2">Add New Design</h4>
                             <form id="new-design-form" class="space-y-3 mb-6 border-b border-gray-400 pb-4">
@@ -2076,7 +2353,9 @@
                             <h4 class="font-semibold brown-text mb-3">Adjust Existing Sewn Stock</h4>
                             <div id="current-design-list" class="space-y-3 mb-6 border-b border-gray-400 pb-4"></div>
                             <h4 class="font-semibold brown-text mb-3">Adjust Existing Cut Stock</h4>
-                            <div id="current-cut-design-list" class="space-y-3"></div>
+                            <div id="current-cut-design-list" class="space-y-3 mb-6 border-b border-gray-400 pb-4"></div>
+                            <h4 class="font-semibold brown-text mb-3">Adjust Existing Finished Stock</h4>
+                            <div id="current-finished-design-list" class="space-y-3"></div>
                         </div>
                     </div>
                 </div>
@@ -2278,5 +2557,4 @@
 
 </body>
 </html>
-
 
